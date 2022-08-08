@@ -1,0 +1,212 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+  html_notebook:
+    toc: yes
+---
+
+This notebook records the full data analysis of the GutAlive+Filtering method study
+
+#1. Load package and datasets
+```{r, message=FALSE, warning=FALSE}
+# load libraries
+library(tidyr)
+library(stringr)
+library(DESeq2)
+library(data.table)
+library(dendextend)
+library(here)
+library(impute)
+library(pvclust)
+library(gplots)
+library(RColorBrewer)
+library(cluster)
+library(xml2)
+library(MSstatsTMT)
+library(pcaMethods)
+library(plotly)
+library(htmlwidgets)
+library(gridExtra)
+library(factoextra)
+library(zoo)
+library(pheatmap)
+library(corrplot)
+library(ggcorrplot)
+
+# read in data files
+proteinGroups <- read.table("data/proteinGroups.txt", sep="\t", header=TRUE)
+evidence <- read.table("data/evidence.txt", sep="\t", header=TRUE)
+annotation.mq <- read.table("metadata/msstatstmt_annotation_GAF_simple.csv", sep=",", header=TRUE)
+experiment_meta <- read.table("metadata/experiment_meta_simple.txt", sep="\t", header=TRUE)
+
+#Subset sample ids by experiments
+sample.filter <- as.list(fread("metadata/sampleID_filtering_list.txt", header = F))
+sample.gutAlive <- as.list(fread("metadata/sampleID_gutAlive_list.txt", header = F))
+```
+
+#2. Process data table and normalize using MSstatsTMT
+```{r, message=FALSE, warning=FALSE}
+require("DreamAI")
+# combine tables for MSstatsTMT
+input.mq <- MaxQtoMSstatsTMTFormat(evidence, proteinGroups, annotation.mq)
+
+# Normalization using MSstatsTMT
+quant.msstats.log <- proteinSummarization(input.mq,
+                                      method="LogSum",
+                                      global_norm=TRUE,
+                                      reference_norm=TRUE,
+                                      remove_norm_channel = TRUE,
+                                      remove_empty_channel = TRUE)
+
+
+#quant.msstats$id <- str_c(quant.msstats$BioReplicate)
+quant.msstats.log$ProteinLevelData$id <- str_c(quant.msstats.log$ProteinLevelData$BioReplicate)
+
+# quant.msstats.log.wide <- quant.msstats.log$ProteinLevelData %>% pivot_wider(id_cols = Protein, names_from = id, values_from = Abundance) 
+
+#subset data according to sample ids
+quant.msstats.log.filter <- filter(quant.msstats.log$ProteinLevelData, str_detect(quant.msstats.log$ProteinLevelData$id, paste(sample.filter[[1]], collapse="|")))
+quant.msstats.log.gutAlive <- filter(quant.msstats.log$ProteinLevelData, str_detect(quant.msstats.log$ProteinLevelData$id, paste(sample.gutAlive[[1]], collapse="|")))
+
+#make wide tables
+log_data.filter <- quant.msstats.log.filter %>% pivot_wider(id_cols = Protein, names_from = id, values_from = Abundance) 
+log_data.gutAlive <- quant.msstats.log.gutAlive %>% pivot_wider(id_cols = Protein, names_from = id, values_from = Abundance) 
+
+#write.table(log_data, "prosessed/processed_logSum_proteins.txt", sep = "\t")
+
+```
+
+#3. Perform PCA analysis
+PCA analysis is performed using NIPALS method which is non-linear, this method avoids the batch effects due to missing values.
+
+##3.1 Filtering test dataset
+```{r, message=FALSE, warning=FALSE}
+# use nipals to do pca
+resNipals  <- pca(t(log_data.filter %>% select(-Protein)), method="nipals", center=T, nPcs=10)
+tmt_scores <- scores(resNipals)
+pca_data <- merge(tmt_scores, experiment_meta, by.x = 0, by.y= "BioReplicate")
+
+pc12 <- ggplot(pca_data, aes(PC1, PC2, colour= Individual)) +
+  geom_point(alpha = 0.5, aes(text= Sample, shape = Condition, size = Culture))+
+  scale_shape_manual(values = 15:20) + theme_bw()
+ggplotly(pc12, tooltip = "text")
+
+# ggsave("Filter_pc12.pdf", width = 6, height = 4)
+
+pc23 <- ggplot(pca_data, aes(PC2, PC3, colour= Individual)) +
+  geom_point(alpha = 0.5, aes(text= Sample, shape = Condition, size = Culture))+
+  scale_shape_manual(values = 15:20)
+ggplotly(pc23, tooltip = "text")
+
+```
+
+##3.2 GutAlive test dataset
+```{r, message=FALSE, warning=FALSE}
+# use nipals to do pca
+resNipals.ga  <- pca(t(log_data.gutAlive %>% select(-Protein)), method="nipals", center=T, nPcs=10)
+tmt_scores.ga <- scores(resNipals.ga)
+pca_data.ga <- merge(tmt_scores.ga, experiment_meta, by.x = 0, by.y= "BioReplicate")
+
+pc12.ga <- ggplot(pca_data.ga, aes(PC1, PC2, colour= Culture)) +
+            geom_point(alpha = 0.6, aes(text= Sample, shape = Condition), size = 3)+
+            scale_shape_manual(values = 12:20)+ theme_bw()
+ggplotly(pc12.ga, tooltip = "text")
+
+# ggsave("GutAlive_pc12.pdf", width = 4, height = 3)
+
+pc23.ga<- ggplot(pca_data.ga, aes(PC2, PC3, colour= Culture)) +
+           geom_point(alpha = 0.6, aes(text= Sample, shape = Condition), size = 3)+
+           scale_shape_manual(values = 12:20)+ theme_bw()
+ggplotly(pc23.ga, tooltip = "text")
+# ggsave("GutAlive_pc23.pdf", width = 4, height = 3)
+
+```
+
+#4. Perform Clustering
+Distance is calculated between sample pairs, this takes commonly shared features between each pair of samples for each calculation.
+
+##4.1 Filtering test dataset
+```{r, message=FALSE, warning=FALSE, fig.width=6, fig.height=12}
+#replacing sample label by actual sample id
+hc.filter.data <- as.data.frame(t(log_data.filter %>% select(-Protein)))
+hc.filter.data <- merge(experiment_meta%>% select(BioReplicate|Sample),
+                        hc.filter.data, by.x = "BioReplicate", by.y= 0)
+rownames(hc.filter.data) <- hc.filter.data$Sample
+
+#calculate distance
+dist.filter <- dist((hc.filter.data %>% select(-BioReplicate|-Sample)), method = "euclidean")
+# do hierarchical cluster
+hc.filter <- hclust(dist.filter, method = "ward.D2")
+
+fviz_dend(hc.filter, k=9, cex = 0.5, main = "Filtering test dataset",
+                  k_colors = c('#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231',
+                               '#911eb4', '#46f0f0', '#f032e6', '#bcf60c'),
+                  color_labels_by_k = TRUE, rect = T,
+                  repel = T, # color labels by groups
+                  xlab = "Samples", ylab = "Distance", sub = "", horiz = T)
+
+ggsave("Filter_cluster.pdf", width = 5, height = 9)
+
+
+```
+
+##4.2 GutAlive dataset
+```{r, message=FALSE, warning=FALSE, fig.width=6, fig.height=12}
+#replacing sample label by actual sample id
+hc.filter.data.ga <- as.data.frame(t(log_data.gutAlive %>% select(-Protein)))
+hc.filter.data.ga <- merge(experiment_meta%>% select(BioReplicate|Sample),
+                        hc.filter.data.ga, by.x = "BioReplicate", by.y= 0)
+rownames(hc.filter.data.ga) <- hc.filter.data.ga$Sample
+
+#calculate distance
+dist.filter.ga <- dist((hc.filter.data.ga %>% select(-BioReplicate|-Sample)), method = "euclidean")
+# do hierarchical cluster
+hc.filter.ga <- hclust(dist.filter.ga, method = "ward.D2")
+
+fviz_dend(hc.filter.ga, k=3, cex = 0.5, main = "GutAlive test dataset",
+                  k_colors = c('#e6194b', '#3cb44b', '#4363d8'),
+                  color_labels_by_k = TRUE, rect = T,
+                  repel = T, # color labels by groups
+                  xlab = "Samples", ylab = "Distance", sub = "", horiz = T)
+
+```
+
+#5. Visualize correlation matrix heatmap
+Similiar to the calculation of distance, here we take commonly shared features between each pair of samples for each calculation of correlation.
+
+##5.1 Filtering test dataset
+```{r, message=FALSE, warning=FALSE, fig.width=12, fig.height=12}
+# Prepare the correct format for calculating correlation
+cor.filter.data <- hc.filter.data %>% select(-BioReplicate) %>% select(-Sample)
+
+# calculate correlation matrix
+cor.filter.matrix <- round(cor(t(cor.filter.data),  method = "spearman", use = "pairwise.complete.obs"), 2)
+
+# draw correlation plot
+ggcorrplot(cor.filter.matrix, hc.order = TRUE) +
+    theme(axis.text.x = element_text(size=8,  angle=90),
+          axis.text.y = element_text(size=8)) +
+    scale_fill_gradient2(limit = c(0.5,1), low = "blue",
+                         high =  "red", mid = "white",
+                         midpoint = 0.75)
+```
+
+##5.2 GutAlive test dataset
+```{r, message=FALSE, warning=FALSE, fig.width=10, fig.height=10}
+# Prepare the correct format for calculating correlation
+cor.filter.data.ga <- hc.filter.data.ga %>% select(-BioReplicate) %>% select(-Sample)
+
+# calculate correlation matrix
+cor.filter.matrix.ga <- round(cor(t(cor.filter.data.ga),  method = "spearman", use = "pairwise.complete.obs"), 2)
+
+# draw correlation plot
+ggcorrplot(cor.filter.matrix.ga, hc.order = TRUE) +
+    theme(axis.text.x = element_text(size=8,  angle=90),
+          axis.text.y = element_text(size=8)) +
+    scale_fill_gradient2(limit = c(0.5,1), low = "blue",
+                         high =  "red", mid = "white",
+                         midpoint = 0.75)
+```
